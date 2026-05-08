@@ -6,11 +6,11 @@ sidebar_position: 5
 
 ## Overview
 
-Some models combine more than one cache type during continuous batching.
+Some models combine more than one cache type in their architecture.
 The most common hybrid case is a model that uses both:
 
 - regular KV-cache inputs for attention layers
-- linear-attention state tables for layers such as CausalConv1D or GatedDeltaNet
+- linear-attention state tables for layers such as `CausalConv1D` or `GatedDeltaNet`.
 
 These models do not have a single cache pool.
 They have at least two different cache pools with different growth rules:
@@ -24,7 +24,7 @@ This distinction matters when configuring `SchedulerConfig`, because the same se
 
 ### KV cache
 
-KV cache capacity is measured in blocks, and each block stores a fixed number of tokens determined by the target device.
+KV cache capacity is measured in blocks, and each block corresponds to a fixed number of tokens determined by the target device.
 Increasing KV capacity increases the number of tokens that can remain resident across active sequences.
 
 Relevant settings:
@@ -52,16 +52,18 @@ Relevant settings:
 ### Linear-attention cache with prefix caching
 
 When `enable_prefix_caching=true`, linear-attention cache switches to paged checkpointing mode.
-Instead of allocating one fixed state block per sequence, the runtime stores checkpoints every `cache_interval` tokens.
+Instead of allocating one fixed state block per sequence, the runtime stores checkpoints every derived cache interval.
+The interval is calculated as `kv_block_size * cache_interval_multiplier` tokens.
+If `cache_interval_multiplier` is unset, the default multiplier is `8` for hybrid models with prefix caching.
 
 Relevant settings:
 
 - `num_linear_attention_blocks`
-- `cache_interval`
+- `cache_interval_multiplier`
 - `num_kv_blocks`
 - `cache_size`
 
-Smaller `cache_interval` values create more checkpoints and consume more linear-attention memory.
+Smaller `cache_interval_multiplier` values create more checkpoints and consume more linear-attention memory.
 Larger values reduce memory usage but make checkpointing coarser.
 
 ## How SchedulerConfig Is Interpreted
@@ -70,34 +72,26 @@ For hybrid-attention models, the following rules are the most useful mental mode
 
 ### Constructor defaults matter
 
-The starting `SchedulerConfig` depends on which pipeline constructor reaches Continuous Batching.
+The starting `SchedulerConfig` depends on pipeline constructor type.
 
-`LLMPipeline` constructors that create the Continuous Batching adapter use a latency-oriented default scheduler configuration when the user does not pass an explicit scheduler config in properties.
-That default changes two important fields:
+`LLMPipeline` and `VLMPipeline` constructors that utilize Continuous Batching use a latency-oriented default scheduler configuration if the user does not pass a scheduler config in `properties`. It is optimized for local non-concurrent usage.
+That default changes two fields:
 
 - `max_num_batched_tokens = std::numeric_limits<size_t>::max()`
 - `enable_prefix_caching = true`
 
-This matters for hybrid-attention models because unlimited `max_num_batched_tokens` is treated as the client-style signal in non-prefix mode.
-
-`ContinuousBatchingPipeline` constructors do not infer that latency-oriented profile on their own.
+`ContinuousBatchingPipeline` constructors do not assume that latency-oriented profile.
 They use the `SchedulerConfig` object that the caller provides.
-If the caller default-constructs `SchedulerConfig`, the relevant defaults remain:
-
-- `max_num_batched_tokens = 256`
-- `max_num_seqs = 256`
-- `enable_prefix_caching = false`
 
 As a result, the same hybrid-attention model can start with different automatic linear-attention sizing depending on the constructor path unless these fields are set explicitly.
 
 ### Explicit KV capacity
 
-If `num_kv_blocks > 0`, it is treated as the explicit KV target.
 If `num_linear_attention_blocks` is left at `0`, the runtime derives linear-attention capacity automatically:
 
 - with `enable_prefix_caching=false` and unlimited `max_num_batched_tokens`, it starts with `1` linear-attention block
 - with `enable_prefix_caching=false` and bounded `max_num_batched_tokens`, it derives linear-attention blocks from `max_num_seqs`
-- with `enable_prefix_caching=true`, it derives linear-attention blocks from the KV token target and `cache_interval`
+- with `enable_prefix_caching=true`, it derives linear-attention blocks as `ceil(num_kv_blocks / cache_interval_multiplier)`
 
 This is the best option when deterministic capacity matters more than fitting into a precise byte budget.
 
@@ -143,7 +137,7 @@ Recommended settings:
 - keep `cache_size=0`
 - leave `num_linear_attention_blocks=0` unless manual control is needed
 - set `max_num_seqs` to the intended concurrency if `enable_prefix_caching=false`
-- set `cache_interval` explicitly if `enable_prefix_caching=true`
+- leave `cache_interval_multiplier` unset to use the default, or set it explicitly when a different prefix-checkpoint granularity is needed
 
 Pros:
 
@@ -165,7 +159,7 @@ Recommended settings:
 - set `cache_size`
 - keep `num_kv_blocks=0`
 - keep `num_linear_attention_blocks=0` unless manual override is required
-- choose `cache_interval` according to the desired prefix-checkpoint granularity if `enable_prefix_caching=true`
+- choose `cache_interval_multiplier` according to the desired prefix-checkpoint granularity if `enable_prefix_caching=true`
 
 Pros:
 
@@ -176,7 +170,7 @@ Pros:
 Cons:
 
 - less direct than explicit block counts
-- derived capacities depend on model cache layout and `cache_interval`
+- derived capacities depend on model cache layout and `cache_interval_multiplier`
 
 ### Scenario 3: High concurrency, no prefix reuse
 
@@ -214,12 +208,12 @@ Recommended settings:
 - set `enable_prefix_caching=true`
 - either set `num_kv_blocks` explicitly or provide `cache_size`
 - keep `num_linear_attention_blocks=0` unless manual tuning is necessary
-- choose `cache_interval` carefully
+- choose `cache_interval_multiplier` carefully
 
-Guidance for `cache_interval`:
+Guidance for `cache_interval_multiplier`:
 
-- smaller interval: more checkpoints, more linear-attention memory, finer-grained reuse
-- larger interval: fewer checkpoints, lower linear-attention memory, coarser reuse
+- smaller multiplier: more checkpoints, more linear-attention memory, finer-grained reuse
+- larger multiplier: fewer checkpoints, lower linear-attention memory, coarser reuse
 
 Pros:
 
@@ -229,8 +223,8 @@ Pros:
 
 Cons:
 
-- `cache_interval` becomes part of memory planning
-- too small an interval can consume linear-attention memory aggressively
+- `cache_interval_multiplier` becomes part of memory planning
+- too small a multiplier can consume linear-attention memory aggressively
 
 ### Scenario 5: Single-stream or interactive client inference without prefix reuse
 
@@ -297,7 +291,7 @@ This is the safest default for hybrid models when the main goal is to respect a 
 - use explicit `num_kv_blocks`
 - keep `num_linear_attention_blocks=0`
 - set bounded `max_num_batched_tokens` and `max_num_seqs` for non-prefix mode
-- set `cache_interval` intentionally for prefix mode
+- leave `cache_interval_multiplier` unset to use the default in prefix mode, or set it intentionally when tuning checkpoint granularity
 
 This is the better default when concurrency and token capacity have already been characterized.
 
@@ -313,8 +307,8 @@ This is the better default when non-prefix hybrid inference is effectively singl
 
 - set `enable_prefix_caching=true`
 - keep `num_linear_attention_blocks=0`
-- start with the default `cache_interval`
-- tune `cache_interval` only if memory pressure or reuse granularity requires it
+- start with the default `cache_interval_multiplier`
+- tune `cache_interval_multiplier` only if memory pressure or reuse granularity requires it
 
 ## When to Set num_linear_attention_blocks Manually
 
@@ -346,4 +340,4 @@ The simplest rule is:
 - use `num_kv_blocks` when explicit capacity matters most
 - use `cache_size` when a shared memory budget matters most
 - keep `num_linear_attention_blocks=0` unless there is a strong reason to override the derived value
-- treat `cache_interval` as a memory-versus-checkpoint-granularity knob when prefix caching is enabled
+- treat `cache_interval_multiplier` as a memory-versus-checkpoint-granularity knob when prefix caching is enabled

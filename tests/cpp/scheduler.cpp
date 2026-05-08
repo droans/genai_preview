@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 #include <numeric>
+#include <set>
 #include "openvino/runtime/core.hpp"
 #include "openvino/op/concat.hpp"
 #include "openvino/genai/continuous_batching_pipeline.hpp"
@@ -27,16 +28,21 @@ void clear_finished_sequences(std::vector<SequenceGroup::Ptr>& requests) {
 
 static constexpr size_t TEST_BLOCK_SIZE = 4;
 static constexpr size_t TEST_NUM_DECODER_LAYERS = 12;
+static constexpr size_t TEST_DEFAULT_CACHE_INTERVAL = TEST_BLOCK_SIZE * DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER;
+static constexpr size_t TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER = 16;
+static constexpr size_t TEST_CUSTOM_CACHE_INTERVAL = TEST_BLOCK_SIZE * TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
+
+size_t get_test_cache_interval(const SchedulerConfig& scheduler_config, size_t kv_block_size = TEST_BLOCK_SIZE) {
+    return scheduler_config.get_cache_interval(kv_block_size);
+}
 
 std::shared_ptr<CacheOrchestrator> init_cache_orchestrator(SchedulerConfig scheduler_config, size_t block_size = TEST_BLOCK_SIZE, size_t num_layers = 1) {
     ov::Core core = ov::Core();
     ov::InferRequest request = core.compile_model(get_dummy_model(core, TEST_NUM_DECODER_LAYERS)).create_infer_request();
-    auto cache_manager = std::make_shared<KVCacheManager>(request);
-    auto block_manager = std::make_shared<BlockManager>(scheduler_config.num_kv_blocks, scheduler_config.enable_prefix_caching, block_size, num_layers);
+    auto cache_manager = std::make_unique<KVCacheManager>(request);
+    auto block_manager = std::make_unique<BlockManager>(scheduler_config.num_kv_blocks, scheduler_config.enable_prefix_caching, block_size, num_layers);
     auto orchestrator = std::make_shared<CacheOrchestrator>();
-    std::vector<size_t> all_layers(num_layers);
-    std::iota(all_layers.begin(), all_layers.end(), 0);
-    orchestrator->register_cache_type(CacheType::KV_CACHE, cache_manager, block_manager, all_layers);
+    orchestrator->register_cache_type(CacheType::KV_CACHE, std::move(cache_manager), std::move(block_manager));
     return orchestrator;
 }
 
@@ -47,41 +53,55 @@ std::shared_ptr<CacheOrchestrator> init_hybrid_cache_orchestrator(SchedulerConfi
     ov::Core core = ov::Core();
     ov::InferRequest request = core.compile_model(get_dummy_hybrid_model(core, kv_num_layers, la_num_layers)).create_infer_request();
 
-    auto kv_cache_manager = std::make_shared<KVCacheManager>(request);
-    auto kv_block_manager = std::make_shared<BlockManager>(scheduler_config.num_kv_blocks,
+    auto kv_cache_manager = std::make_unique<KVCacheManager>(request);
+    auto kv_block_manager = std::make_unique<BlockManager>(scheduler_config.num_kv_blocks,
                                                            scheduler_config.enable_prefix_caching,
                                                            kv_block_size,
                                                            kv_num_layers);
 
-    auto la_cache_manager = std::make_shared<LinearAttentionCacheManager>(request);
-    std::shared_ptr<BlockManager> la_block_manager;
+    auto la_cache_manager = std::make_unique<LinearAttentionCacheManager>(request);
+    std::unique_ptr<BlockManager> la_block_manager;
     if (scheduler_config.enable_prefix_caching) {
-        la_block_manager = std::make_shared<BlockManager>(scheduler_config.num_linear_attention_blocks,
+        la_block_manager = std::make_unique<BlockManager>(scheduler_config.num_linear_attention_blocks,
                                                           true,
-                                                          scheduler_config.cache_interval,
-                                                          la_cache_manager->get_num_layers());
+                                                          get_test_cache_interval(scheduler_config, kv_block_size),
+                                                          1);
     } else {
         const size_t num_la_blocks = scheduler_config.num_linear_attention_blocks > 0
                                          ? scheduler_config.num_linear_attention_blocks
                                          : (scheduler_config.num_kv_blocks > 0 ? scheduler_config.max_num_seqs : 0);
-        la_block_manager = std::make_shared<BlockManager>(num_la_blocks,
+        la_block_manager = std::make_unique<BlockManager>(num_la_blocks,
                                                           false,
                                                           1,
-                                                          la_cache_manager->get_num_layers(),
+                                                          1,  // one logical block table for all LA layers
                                                           1);
     }
 
     auto orchestrator = std::make_shared<CacheOrchestrator>();
-    std::vector<size_t> kv_layer_ids(kv_num_layers);
-    std::iota(kv_layer_ids.begin(), kv_layer_ids.end(), 0);
-    orchestrator->register_cache_type(CacheType::KV_CACHE, kv_cache_manager, kv_block_manager, kv_layer_ids);
+    orchestrator->register_cache_type(CacheType::KV_CACHE, std::move(kv_cache_manager), std::move(kv_block_manager));
 
-    std::vector<size_t> la_layer_ids(la_cache_manager->get_num_layers());
-    std::iota(la_layer_ids.begin(), la_layer_ids.end(), kv_num_layers);
     orchestrator->register_cache_type(CacheType::LINEAR_ATTENTION_CACHE,
-                                      la_cache_manager,
-                                      la_block_manager,
-                                      la_layer_ids);
+                                      std::move(la_cache_manager),
+                                      std::move(la_block_manager));
+    return orchestrator;
+}
+
+std::shared_ptr<CacheOrchestrator> init_linear_attention_cache_orchestrator(SchedulerConfig scheduler_config,
+                                                                            size_t la_num_layers = 1) {
+    ov::Core core = ov::Core();
+    ov::InferRequest request = core.compile_model(get_dummy_hybrid_model(core, 0, la_num_layers)).create_infer_request();
+
+    auto la_cache_manager = std::make_unique<LinearAttentionCacheManager>(request);
+    auto la_block_manager = std::make_unique<BlockManager>(scheduler_config.num_linear_attention_blocks,
+                                                           false,
+                                                           1,
+                                                           1,
+                                                           1);
+
+    auto orchestrator = std::make_shared<CacheOrchestrator>();
+    orchestrator->register_cache_type(CacheType::LINEAR_ATTENTION_CACHE,
+                                      std::move(la_cache_manager),
+                                      std::move(la_block_manager));
     return orchestrator;
 }
 
@@ -231,10 +251,19 @@ TEST(TestScheduler, hybrid_output_fills_linear_attention_block_table_in_prompt_a
     auto seq_id2 = seq_group2->get_running_sequences()[0]->get_id();
     std::vector<SequenceGroup::Ptr> requests = {seq_group1, seq_group2};
 
-    auto orchestrator = init_hybrid_cache_orchestrator(scheduler_config);
+    auto orchestrator = init_hybrid_cache_orchestrator(scheduler_config,
+                                                       TEST_BLOCK_SIZE,
+                                                       /*kv_num_layers=*/1,
+                                                       /*la_num_layers=*/3);
     Scheduler scheduler = Scheduler(orchestrator, scheduler_config);
     auto prompt_out = scheduler.schedule(requests);
 
+    EXPECT_EQ(orchestrator->get_cache_manager(CacheType::LINEAR_ATTENTION_CACHE).get_num_layers(), 3);
+    EXPECT_EQ(orchestrator->get_cache_manager(CacheType::LINEAR_ATTENTION_CACHE).get_num_cache_tensors(), 6);
+    ASSERT_EQ(prompt_out.m_block_tables.at(seq_id1).size(), 2);
+    ASSERT_EQ(prompt_out.m_block_tables.at(seq_id2).size(), 2);
+    EXPECT_EQ(prompt_out.m_block_tables.at(seq_id1)[1].size(), 1);
+    EXPECT_EQ(prompt_out.m_block_tables.at(seq_id2)[1].size(), 1);
     EXPECT_TRUE(prompt_out.m_linear_attention_paging_data.count(seq_id1));
     EXPECT_TRUE(prompt_out.m_linear_attention_paging_data.count(seq_id2));
     EXPECT_EQ(prompt_out.m_linear_attention_paging_data.at(seq_id1).block_indices.size(), 2);
@@ -303,6 +332,57 @@ TEST(TestScheduler, hybrid_non_prefix_linear_attention_returns_aliased_read_writ
     }
 }
 
+TEST(TestScheduler, hybrid_non_prefix_linear_attention_uses_full_preemption_for_fixed_size_victim_state) {
+    SchedulerConfig scheduler_config;
+    scheduler_config.max_num_batched_tokens = 32;
+    scheduler_config.num_kv_blocks = 4;
+    scheduler_config.num_linear_attention_blocks = 2;
+    scheduler_config.enable_prefix_caching = false;
+    scheduler_config.dynamic_split_fuse = false;
+    scheduler_config.max_num_seqs = 8;
+
+    std::vector<uint64_t> tokens = {0, 1, 2, 3};
+    SequenceGroup::Ptr seq_group1 = std::make_shared<SequenceGroup>(
+        0,
+        ov::Tensor(ov::element::i64, {tokens.size()}, tokens.data()),
+        utils::get_greedy_config());
+    SequenceGroup::Ptr seq_group2 = std::make_shared<SequenceGroup>(
+        1,
+        ov::Tensor(ov::element::i64, {tokens.size()}, tokens.data()),
+        utils::get_greedy_config());
+    const auto seq_id1 = seq_group1->get_running_sequences()[0]->get_id();
+    const auto seq_id2 = seq_group2->get_running_sequences()[0]->get_id();
+    std::vector<SequenceGroup::Ptr> requests = {seq_group1, seq_group2};
+
+    auto orchestrator = init_hybrid_cache_orchestrator(scheduler_config);
+    Scheduler scheduler = Scheduler(orchestrator, scheduler_config);
+    auto prompt_out = scheduler.schedule(requests);
+
+    EXPECT_EQ(prompt_out.m_scheduled_sequence_groups_ids.size(), 2);
+    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id1).size(), 1);
+    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id2).size(), 1);
+
+    for (auto& req : requests) {
+        req->finish_iteration();
+    }
+
+    for (size_t step = 0; step < TEST_BLOCK_SIZE; ++step) {
+        std::ignore = scheduler.schedule(requests);
+        for (auto& req : requests) {
+            req->get_running_sequences()[0]->append_token(42, 0.9f);
+            req->finish_iteration();
+        }
+    }
+
+    auto gen_out = scheduler.schedule(requests);
+
+    EXPECT_EQ(gen_out.m_scheduled_sequence_groups_ids, std::vector<uint64_t>({0}));
+    EXPECT_FALSE(scheduler.has_block_table(seq_id2));
+    EXPECT_EQ(seq_group2->get_num_processed_tokens(), 0);
+
+    scheduler.free_sequence(seq_id1);
+}
+
 TEST(TestScheduler, hybrid_admission_when_la_pool_is_bottleneck) {
     SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = 32;
@@ -357,9 +437,9 @@ TEST(TestScheduler, hybrid_initialize_cache_grows_fixed_size_by_total_concurrent
     auto orchestrator = init_hybrid_cache_orchestrator(scheduler_config);
     Scheduler scheduler = Scheduler(orchestrator, scheduler_config);
 
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(), 0);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 0);
     std::ignore = scheduler.schedule(requests);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(), 2);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 2);
 
     for (auto& req : requests) {
         for (auto& seq : req->get_sequences()) {
@@ -368,7 +448,36 @@ TEST(TestScheduler, hybrid_initialize_cache_grows_fixed_size_by_total_concurrent
     }
 }
 
-TEST(TestScheduler, DISABLED_hybrid_runtime_arrival_beyond_initial_fixed_capacity_schedules_after_growth) {
+TEST(TestScheduler, linear_attention_only_initializes_fixed_size_capacity) {
+    SchedulerConfig scheduler_config;
+    scheduler_config.max_num_batched_tokens = 32;
+    scheduler_config.num_kv_blocks = 0;
+    scheduler_config.cache_size = 0;
+    scheduler_config.num_linear_attention_blocks = 0;
+    scheduler_config.dynamic_split_fuse = true;
+    scheduler_config.max_num_seqs = 8;
+
+    std::vector<uint64_t> tokens = {0, 1, 2, 3};
+    SequenceGroup::Ptr seq_group = std::make_shared<SequenceGroup>(0,
+                                                                    ov::Tensor(ov::element::i64, {tokens.size()}, tokens.data()),
+                                                                    utils::get_greedy_config());
+    const auto seq_id = seq_group->get_running_sequences()[0]->get_id();
+    std::vector<SequenceGroup::Ptr> requests = {seq_group};
+
+    auto orchestrator = init_linear_attention_cache_orchestrator(scheduler_config);
+    Scheduler scheduler = Scheduler(orchestrator, scheduler_config);
+
+    EXPECT_FALSE(orchestrator->has_token_capacity());
+    auto out = scheduler.schedule(requests);
+
+    EXPECT_EQ(out.m_scheduled_sequence_groups_ids.size(), 1);
+    EXPECT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 1);
+
+    scheduler.free_sequence(seq_id);
+}
+
+TEST(TestScheduler, hybrid_runtime_arrival_beyond_initial_fixed_capacity_schedules_after_growth) {
     SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = 32;
     scheduler_config.num_kv_blocks = 0;
@@ -388,7 +497,7 @@ TEST(TestScheduler, DISABLED_hybrid_runtime_arrival_beyond_initial_fixed_capacit
 
     std::vector<SequenceGroup::Ptr> requests = {seq_group1};
     std::ignore = scheduler.schedule(requests);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(), 1);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 1);
 
     auto running = seq_group1->get_running_sequences();
     running[0]->append_token(42, 0.9f);
@@ -403,10 +512,18 @@ TEST(TestScheduler, DISABLED_hybrid_runtime_arrival_beyond_initial_fixed_capacit
     auto out = scheduler.schedule(requests);
     EXPECT_TRUE(out.m_linear_attention_paging_data.count(seq_id1));
     EXPECT_TRUE(out.m_linear_attention_paging_data.count(seq_id2));
+
+    for (auto& req : requests) {
+        for (auto& seq : req->get_sequences()) {
+            if (scheduler.has_block_table(seq->get_id())) {
+                scheduler.free_sequence(seq->get_id());
+            }
+        }
+    }
 }
 
 TEST(TestScheduler, hybrid_prefix_caching_prefill_requires_read_and_interval_write_blocks) {
-    // Target contract (cache_interval=128):
+    // Target contract (cache_interval=32):
     // prefill requires 1 read block + ceil((processed % interval + scheduled) / interval) write blocks,
     // with the zero-state read reusing the first write block.
     SchedulerConfig scheduler_config;
@@ -417,7 +534,7 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_requires_read_and_interval_wri
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 8;
 
-    // Prompt length 260 => write blocks = ceil((0 + 260) / 128) = 3, plus one read block => 4 total.
+    // Prompt length 260 => write blocks = ceil((0 + 260) / 32) = 9, plus one read block => 10 total.
     std::vector<uint64_t> tokens(260);
     std::iota(tokens.begin(), tokens.end(), 0);
     SequenceGroup::Ptr seq_group = std::make_shared<SequenceGroup>(
@@ -433,12 +550,12 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_requires_read_and_interval_wri
 
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
-    ASSERT_EQ(paging_data.block_indices.size(), 4);
+    ASSERT_EQ(paging_data.block_indices.size(), 10);
     EXPECT_EQ(paging_data.past_length, 0);
-    EXPECT_EQ(paging_data.cache_interval, DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL);
+    EXPECT_EQ(paging_data.cache_interval, TEST_DEFAULT_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
-    EXPECT_EQ(std::set<int32_t>(paging_data.block_indices.begin(), paging_data.block_indices.end()).size(), 3);
-    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 3);
+    EXPECT_EQ(std::set<int32_t>(paging_data.block_indices.begin(), paging_data.block_indices.end()).size(), 9);
+    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 9);
 
     for (auto& req : requests) {
         for (auto& seq : req->get_sequences()) {
@@ -447,12 +564,12 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_requires_read_and_interval_wri
     }
 }
 
-TEST(TestScheduler, hybrid_prefix_caching_prefill_uses_scheduler_config_cache_interval) {
+TEST(TestScheduler, hybrid_prefix_caching_prefill_uses_scheduler_config_cache_interval_multiplier) {
     SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = 128;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -473,10 +590,10 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_uses_scheduler_config_cache_in
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
     ASSERT_EQ(paging_data.block_indices.size(), 3);
-    EXPECT_EQ(paging_data.cache_interval, 64);
+    EXPECT_EQ(paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
     EXPECT_NE(paging_data.block_indices[1], paging_data.block_indices[2]);
-    EXPECT_EQ(orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE), 64);
+    EXPECT_EQ(orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE), TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 2);
 
     for (auto& req : requests) {
@@ -491,7 +608,7 @@ TEST(TestScheduler, hybrid_prefix_caching_reuses_active_complete_linear_attentio
     scheduler_config.max_num_batched_tokens = 16;
     scheduler_config.num_kv_blocks = 16;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = TEST_BLOCK_SIZE;
+    scheduler_config.cache_interval_multiplier = 1;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -549,7 +666,7 @@ TEST(TestScheduler, hybrid_prefix_caching_reuses_active_incomplete_linear_attent
     scheduler_config.max_num_batched_tokens = 16;
     scheduler_config.num_kv_blocks = 16;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = TEST_BLOCK_SIZE;
+    scheduler_config.cache_interval_multiplier = 1;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -609,7 +726,7 @@ TEST(TestScheduler, hybrid_prefix_caching_restore_uses_minimum_common_prefix_acr
     scheduler_config.max_num_batched_tokens = 8;
     scheduler_config.num_kv_blocks = 4;
     scheduler_config.num_linear_attention_blocks = 2;
-    scheduler_config.cache_interval = TEST_BLOCK_SIZE;
+    scheduler_config.cache_interval_multiplier = 1;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -657,7 +774,7 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_exactly_interval_uses_single_w
     scheduler_config.max_num_batched_tokens = 64;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -679,7 +796,7 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_exactly_interval_uses_single_w
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
     ASSERT_EQ(paging_data.block_indices.size(), 2);
     EXPECT_EQ(paging_data.past_length, 0);
-    EXPECT_EQ(paging_data.cache_interval, 64);
+    EXPECT_EQ(paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 1);
 
@@ -695,7 +812,7 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_interval_plus_one_uses_next_wr
     scheduler_config.max_num_batched_tokens = 128;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -717,7 +834,7 @@ TEST(TestScheduler, hybrid_prefix_caching_prefill_interval_plus_one_uses_next_wr
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
     ASSERT_EQ(paging_data.block_indices.size(), 3);
     EXPECT_EQ(paging_data.past_length, 0);
-    EXPECT_EQ(paging_data.cache_interval, 64);
+    EXPECT_EQ(paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
     EXPECT_NE(paging_data.block_indices[1], paging_data.block_indices[2]);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 2);
@@ -734,7 +851,7 @@ TEST(TestScheduler, hybrid_prefix_caching_chunked_prefill_crossing_interval_adds
     scheduler_config.max_num_batched_tokens = 48;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = true;
     scheduler_config.max_num_seqs = 4;
@@ -765,7 +882,7 @@ TEST(TestScheduler, hybrid_prefix_caching_chunked_prefill_crossing_interval_adds
     const auto& second_paging_data = second_out.m_linear_attention_paging_data.at(seq_id);
     ASSERT_EQ(second_paging_data.block_indices.size(), 3);
     EXPECT_EQ(second_paging_data.past_length, 48);
-    EXPECT_EQ(second_paging_data.cache_interval, 64);
+    EXPECT_EQ(second_paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(second_paging_data.block_indices[0], second_paging_data.block_indices[1]);
     EXPECT_NE(second_paging_data.block_indices[1], second_paging_data.block_indices[2]);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 2);
@@ -782,7 +899,7 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_multiple_tokens_crossing_in
     scheduler_config.max_num_batched_tokens = 8;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = true;
     scheduler_config.max_num_seqs = 4;
@@ -815,7 +932,7 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_multiple_tokens_crossing_in
     ASSERT_EQ(paging_data.block_indices.size(), 3);
     EXPECT_EQ(seq_group->get_num_scheduled_tokens(), 3);
     EXPECT_EQ(paging_data.past_length, 62);
-    EXPECT_EQ(paging_data.cache_interval, 64);
+    EXPECT_EQ(paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
     EXPECT_NE(paging_data.block_indices[1], paging_data.block_indices[2]);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 2);
@@ -827,12 +944,12 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_multiple_tokens_crossing_in
     }
 }
 
-TEST(TestScheduler, hybrid_prefix_caching_cache_interval_one_allocates_block_per_token) {
+TEST(TestScheduler, hybrid_prefix_caching_cache_interval_multiplier_one_allocates_block_per_kv_block) {
     SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = 8;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 16;
-    scheduler_config.cache_interval = 1;
+    scheduler_config.cache_interval_multiplier = 1;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = false;
     scheduler_config.max_num_seqs = 4;
@@ -851,11 +968,11 @@ TEST(TestScheduler, hybrid_prefix_caching_cache_interval_one_allocates_block_per
 
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
-    ASSERT_EQ(paging_data.block_indices.size(), 4);
-    EXPECT_EQ(paging_data.cache_interval, 1);
+    ASSERT_EQ(paging_data.block_indices.size(), 2);
+    EXPECT_EQ(paging_data.cache_interval, TEST_BLOCK_SIZE);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
-    EXPECT_EQ(std::set<int32_t>(paging_data.block_indices.begin(), paging_data.block_indices.end()).size(), 3);
-    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 3);
+    EXPECT_EQ(std::set<int32_t>(paging_data.block_indices.begin(), paging_data.block_indices.end()).size(), 1);
+    EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 1);
 
     for (auto& req : requests) {
         for (auto& seq : req->get_sequences()) {
@@ -864,13 +981,13 @@ TEST(TestScheduler, hybrid_prefix_caching_cache_interval_one_allocates_block_per
     }
 }
 
-TEST(TestScheduler, hybrid_prefix_caching_dynamic_allocation_honors_custom_cache_interval) {
+TEST(TestScheduler, hybrid_prefix_caching_dynamic_allocation_honors_custom_cache_interval_multiplier) {
     SchedulerConfig scheduler_config;
     scheduler_config.max_num_batched_tokens = 128;
     scheduler_config.num_kv_blocks = 0;
     scheduler_config.cache_size = 0;
     scheduler_config.num_linear_attention_blocks = 0;
-    scheduler_config.cache_interval = 64;
+    scheduler_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     scheduler_config.enable_prefix_caching = true;
     scheduler_config.dynamic_split_fuse = true;
     scheduler_config.max_num_seqs = 4;
@@ -891,10 +1008,10 @@ TEST(TestScheduler, hybrid_prefix_caching_dynamic_allocation_honors_custom_cache
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
     const auto& paging_data = out.m_linear_attention_paging_data.at(seq_id);
     ASSERT_EQ(paging_data.block_indices.size(), 3);
-    EXPECT_EQ(paging_data.cache_interval, 64);
+    EXPECT_EQ(paging_data.cache_interval, TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(paging_data.block_indices[0], paging_data.block_indices[1]);
     EXPECT_NE(paging_data.block_indices[1], paging_data.block_indices[2]);
-    EXPECT_EQ(orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE), 64);
+    EXPECT_EQ(orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE), TEST_CUSTOM_CACHE_INTERVAL);
     EXPECT_EQ(orchestrator->get_linear_attention_block_table(seq_id).size(), 2);
 
     for (auto& req : requests) {
@@ -904,19 +1021,25 @@ TEST(TestScheduler, hybrid_prefix_caching_dynamic_allocation_honors_custom_cache
     }
 }
 
-TEST(TestScheduler, scheduler_config_zero_cache_interval_requires_disabled_prefix_caching) {
+TEST(TestScheduler, scheduler_config_zero_cache_interval_multiplier_requires_disabled_prefix_caching) {
     SchedulerConfig scheduler_config;
     scheduler_config.enable_prefix_caching = true;
-    scheduler_config.cache_interval = 0;
+
+    EXPECT_FALSE(scheduler_config.cache_interval_multiplier.has_value());
+    EXPECT_NO_THROW(scheduler_config.validate());
+    EXPECT_EQ(get_test_cache_interval(scheduler_config), TEST_DEFAULT_CACHE_INTERVAL);
+
+    scheduler_config.cache_interval_multiplier = 0;
 
     EXPECT_ANY_THROW(scheduler_config.validate());
 
     scheduler_config.enable_prefix_caching = false;
     EXPECT_NO_THROW(scheduler_config.validate());
-    EXPECT_EQ(scheduler_config.cache_interval, 0);
+    ASSERT_TRUE(scheduler_config.cache_interval_multiplier.has_value());
+    EXPECT_EQ(scheduler_config.cache_interval_multiplier.value(), 0);
 }
 
-TEST(TestScheduler, scheduler_config_custom_cache_interval_requires_linear_attention_model) {
+TEST(TestScheduler, scheduler_config_custom_cache_interval_multiplier_requires_linear_attention_model) {
     ov::Core core;
     ov::InferRequest request = core.compile_model(get_dummy_model(core, TEST_NUM_DECODER_LAYERS)).create_infer_request();
     auto get_available_memory = [](const std::string&, size_t) {
@@ -925,11 +1048,17 @@ TEST(TestScheduler, scheduler_config_custom_cache_interval_requires_linear_atten
 
     SchedulerConfig default_config;
     default_config.num_kv_blocks = 64;
+    EXPECT_FALSE(default_config.cache_interval_multiplier.has_value());
     EXPECT_NO_THROW(CacheOrchestrator::create(request, default_config, get_available_memory));
+
+    SchedulerConfig explicit_default_config;
+    explicit_default_config.num_kv_blocks = 64;
+    explicit_default_config.cache_interval_multiplier = DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER;
+    EXPECT_ANY_THROW(CacheOrchestrator::create(request, explicit_default_config, get_available_memory));
 
     SchedulerConfig custom_interval_config;
     custom_interval_config.num_kv_blocks = 64;
-    custom_interval_config.cache_interval = 64;
+    custom_interval_config.cache_interval_multiplier = TEST_CUSTOM_CACHE_INTERVAL_MULTIPLIER;
     EXPECT_ANY_THROW(CacheOrchestrator::create(request, custom_interval_config, get_available_memory));
 }
 
@@ -944,14 +1073,14 @@ TEST(TestScheduler, hybrid_create_explicit_kv_blocks_derives_single_fixed_linear
     scheduler_config.max_num_seqs = 7;
     scheduler_config.max_num_batched_tokens = std::numeric_limits<size_t>::max();
     scheduler_config.enable_prefix_caching = false;
-    scheduler_config.cache_interval = 0;
+    scheduler_config.cache_interval_multiplier = 0;
 
     auto orchestrator = CacheOrchestrator::create(context.request, scheduler_config, get_available_memory);
 
     ASSERT_EQ(scheduler_config.num_kv_blocks, 64);
     EXPECT_EQ(scheduler_config.num_linear_attention_blocks, 1);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE)->get_total_number_of_kv_blocks(), 64);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(), 1);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE).get_total_number_of_kv_blocks(), 64);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 1);
 }
 
 TEST(TestScheduler, hybrid_create_explicit_kv_blocks_derives_fixed_linear_attention_capacity_from_max_num_seqs_for_bounded_batching) {
@@ -965,14 +1094,14 @@ TEST(TestScheduler, hybrid_create_explicit_kv_blocks_derives_fixed_linear_attent
     scheduler_config.max_num_seqs = 7;
     scheduler_config.max_num_batched_tokens = 32;
     scheduler_config.enable_prefix_caching = false;
-    scheduler_config.cache_interval = 0;
+    scheduler_config.cache_interval_multiplier = 0;
 
     auto orchestrator = CacheOrchestrator::create(context.request, scheduler_config, get_available_memory);
 
     ASSERT_EQ(scheduler_config.num_kv_blocks, 64);
     EXPECT_EQ(scheduler_config.num_linear_attention_blocks, scheduler_config.max_num_seqs);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE)->get_total_number_of_kv_blocks(), 64);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(),
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE).get_total_number_of_kv_blocks(), 64);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(),
               scheduler_config.max_num_seqs);
 }
 
@@ -985,16 +1114,17 @@ TEST(TestScheduler, hybrid_create_explicit_kv_blocks_derives_paged_linear_attent
     SchedulerConfig scheduler_config;
     scheduler_config.num_kv_blocks = 10;
     scheduler_config.enable_prefix_caching = true;
-    scheduler_config.cache_interval = 16;
+    scheduler_config.cache_interval_multiplier = 1;
 
     auto orchestrator = CacheOrchestrator::create(context.request, scheduler_config, get_available_memory);
 
     const size_t expected_token_capacity = scheduler_config.num_kv_blocks * context.kv_block_size;
-    const size_t expected_la_blocks = (expected_token_capacity + scheduler_config.cache_interval - 1) / scheduler_config.cache_interval;
+    const size_t cache_interval = scheduler_config.get_cache_interval(context.kv_block_size);
+    const size_t expected_la_blocks = (expected_token_capacity + cache_interval - 1) / cache_interval;
 
     ASSERT_EQ(scheduler_config.num_kv_blocks, 10);
     EXPECT_EQ(scheduler_config.num_linear_attention_blocks, expected_la_blocks);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(),
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(),
               expected_la_blocks);
 }
 
@@ -1009,7 +1139,7 @@ TEST(TestScheduler, hybrid_create_cache_size_budget_reserves_fixed_linear_attent
     scheduler_config.max_num_seqs = 5;
     scheduler_config.max_num_batched_tokens = 32;
     scheduler_config.enable_prefix_caching = false;
-    scheduler_config.cache_interval = 0;
+    scheduler_config.cache_interval_multiplier = 0;
 
     const size_t total_budget_in_bytes = scheduler_config.cache_size * 1024ULL * 1024ULL * 1024ULL;
     const size_t reserved_la_bytes = scheduler_config.max_num_seqs * context.la_block_size_in_bytes;
@@ -1035,12 +1165,13 @@ TEST(TestScheduler, hybrid_create_cache_size_budget_derives_paged_linear_attenti
     SchedulerConfig scheduler_config;
     scheduler_config.cache_size = 1;
     scheduler_config.enable_prefix_caching = true;
-    scheduler_config.cache_interval = 16;
+    scheduler_config.cache_interval_multiplier = 1;
 
     const size_t total_budget_in_bytes = scheduler_config.cache_size * 1024ULL * 1024ULL * 1024ULL;
     const auto bytes_for_token_target = [&](size_t token_target) {
         const size_t kv_blocks = (token_target + context.kv_block_size - 1) / context.kv_block_size;
-        const size_t la_blocks = (token_target + scheduler_config.cache_interval - 1) / scheduler_config.cache_interval;
+        const size_t cache_interval = scheduler_config.get_cache_interval(context.kv_block_size);
+        const size_t la_blocks = (token_target + cache_interval - 1) / cache_interval;
         return kv_blocks * context.kv_block_size_in_bytes + la_blocks * context.la_block_size_in_bytes;
     };
 
@@ -1057,7 +1188,8 @@ TEST(TestScheduler, hybrid_create_cache_size_budget_derives_paged_linear_attenti
 
     const size_t expected_token_target = low;
     const size_t expected_kv_blocks = (expected_token_target + context.kv_block_size - 1) / context.kv_block_size;
-    const size_t expected_la_blocks = (expected_token_target + scheduler_config.cache_interval - 1) / scheduler_config.cache_interval;
+    const size_t cache_interval = scheduler_config.get_cache_interval(context.kv_block_size);
+    const size_t expected_la_blocks = (expected_token_target + cache_interval - 1) / cache_interval;
 
     auto orchestrator = CacheOrchestrator::create(context.request, scheduler_config, get_available_memory);
 
@@ -1076,14 +1208,14 @@ TEST(TestScheduler, hybrid_create_zero_budget_keeps_all_cache_pools_dynamic) {
 
     SchedulerConfig scheduler_config;
     scheduler_config.enable_prefix_caching = false;
-    scheduler_config.cache_interval = 0;
+    scheduler_config.cache_interval_multiplier = 0;
 
     auto orchestrator = CacheOrchestrator::create(context.request, scheduler_config, get_available_memory);
 
     EXPECT_EQ(scheduler_config.num_kv_blocks, 0);
     EXPECT_EQ(scheduler_config.num_linear_attention_blocks, 0);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE)->get_total_number_of_kv_blocks(), 0);
-    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->get_total_number_of_kv_blocks(), 0);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::KV_CACHE).get_total_number_of_kv_blocks(), 0);
+    EXPECT_EQ(orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).get_total_number_of_kv_blocks(), 0);
 }
 
 TEST(TestScheduler, scheduler_config_explicit_linear_attention_blocks_require_linear_attention_model) {
@@ -1096,7 +1228,7 @@ TEST(TestScheduler, scheduler_config_explicit_linear_attention_blocks_require_li
     SchedulerConfig scheduler_config;
     scheduler_config.num_kv_blocks = 64;
     scheduler_config.num_linear_attention_blocks = 4;
-    scheduler_config.cache_interval = 0;
+    scheduler_config.cache_interval_multiplier = 0;
 
     EXPECT_ANY_THROW(CacheOrchestrator::create(request, scheduler_config, get_available_memory));
 }
@@ -1128,12 +1260,12 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_finishing_interval_reuses_s
     }
 
     auto running_sequence = seq_group->get_running_sequences()[0];
-    for (size_t token = tokens.size(); token < 127; ++token) {
+    for (size_t token = tokens.size(); token < TEST_DEFAULT_CACHE_INTERVAL - 1; ++token) {
         running_sequence->append_token(token, 0.9f);
     }
 
-    // processed=127, scheduled=1 stores the 128-token checkpoint in the current block.
-    seq_group->update_processed_tokens_num(127);
+    // processed=31, scheduled=1 stores the 32-token checkpoint in the current block.
+    seq_group->update_processed_tokens_num(TEST_DEFAULT_CACHE_INTERVAL - 1);
     auto out = scheduler.schedule(requests);
 
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
@@ -1141,7 +1273,7 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_finishing_interval_reuses_s
     const auto read_idx = out.m_linear_attention_paging_data.at(seq_id).block_indices[0];
     const auto write_idx = out.m_linear_attention_paging_data.at(seq_id).block_indices[1];
     EXPECT_EQ(read_idx, write_idx);
-    EXPECT_EQ(out.m_linear_attention_paging_data.at(seq_id).cache_interval, DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL);
+    EXPECT_EQ(out.m_linear_attention_paging_data.at(seq_id).cache_interval, TEST_DEFAULT_CACHE_INTERVAL);
 
     for (auto& req : requests) {
         for (auto& seq : req->get_sequences()) {
@@ -1178,11 +1310,11 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_after_completed_interval_sw
     }
 
     auto running_sequence = seq_group->get_running_sequences()[0];
-    for (size_t token = tokens.size(); token < DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL; ++token) {
+    for (size_t token = tokens.size(); token < TEST_DEFAULT_CACHE_INTERVAL; ++token) {
         running_sequence->append_token(token, 0.9f);
     }
 
-    seq_group->update_processed_tokens_num(DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL);
+    seq_group->update_processed_tokens_num(TEST_DEFAULT_CACHE_INTERVAL);
     auto out = scheduler.schedule(requests);
 
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
@@ -1226,12 +1358,12 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_inside_interval_reuses_same
     }
 
     auto running_sequence = seq_group->get_running_sequences()[0];
-    for (size_t token = tokens.size(); token < 127; ++token) {
+    for (size_t token = tokens.size(); token < TEST_DEFAULT_CACHE_INTERVAL - 1; ++token) {
         running_sequence->append_token(token, 0.9f);
     }
 
-    // processed=126, scheduled=1 does not cross cache_interval=128 boundary.
-    seq_group->update_processed_tokens_num(126);
+    // processed=30, scheduled=1 does not cross cache_interval=32 boundary.
+    seq_group->update_processed_tokens_num(TEST_DEFAULT_CACHE_INTERVAL - 2);
     auto out = scheduler.schedule(requests);
 
     ASSERT_TRUE(out.m_linear_attention_paging_data.count(seq_id));
@@ -1239,7 +1371,7 @@ TEST(TestScheduler, hybrid_prefix_caching_generation_inside_interval_reuses_same
     const auto read_idx = out.m_linear_attention_paging_data.at(seq_id).block_indices[0];
     const auto write_idx = out.m_linear_attention_paging_data.at(seq_id).block_indices[1];
     EXPECT_EQ(read_idx, write_idx);
-    EXPECT_EQ(out.m_linear_attention_paging_data.at(seq_id).cache_interval, DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL);
+    EXPECT_EQ(out.m_linear_attention_paging_data.at(seq_id).cache_interval, TEST_DEFAULT_CACHE_INTERVAL);
 
     for (auto& req : requests) {
         for (auto& seq : req->get_sequences()) {

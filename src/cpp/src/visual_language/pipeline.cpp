@@ -27,6 +27,12 @@
 using namespace ov::genai;
 
 namespace {
+void log_paged_attention_fallback(const ov::Exception& exception) {
+    GENAI_WARN("Paged Attention backend initialization failed. Falling back to SDPA backend. "
+                "Use explicit backend=\"SDPA\" to skip Paged Attention initialization.");
+    GENAI_DEBUG("Paged Attention backend initialization error: %s", exception.what());
+}
+
 void update_npu_properties(const std::filesystem::path& models_dir, ov::AnyMap& properties) {
     auto vlm_config = utils::from_config_json_if_exists<VLMConfig>(models_dir, "config.json");
     switch (vlm_config.model_type) {
@@ -771,7 +777,6 @@ private:
 
         std::vector<SequenceGroup::Ptr> requests;
         size_t request_id = 0;
-        size_t block_size = 1; // not used
 
         const size_t history_size = m_language.get_tensor("attention_mask").get_shape().at(1) - cache_state.num_tokens_to_trim;
         const size_t inputs_embeds_size = inputs_embeds.get_shape().at(1);
@@ -867,8 +872,8 @@ VLMPipeline::VLMPipeline(
                     m_pimpl = std::make_unique<VLMContinuousBatchingAdapter>(language_model->clone(), models_dir, scheduler_config, device, plugin_properties);
 #endif
             } catch (const ov::Exception& exception) {
-                GENAI_WARN("Paged Attention backend initialization failed. Falling back to SDPA backend.");
-                GENAI_DEBUG("Paged Attention backend initialization error: %s", exception.what());
+                log_paged_attention_fallback(exception);
+                language_model = utils::singleton_core().read_model(language_model_path, {}, properties);
             }
         }
 
@@ -916,8 +921,8 @@ VLMPipeline::VLMPipeline(
                     m_pimpl = std::make_unique<VLMContinuousBatchingAdapter>(language_model->clone(), models_map, tokenizer, config_dir_path, scheduler_config, device, plugin_properties, generation_config);
     #endif
             } catch (const ov::Exception& exception) {
-                GENAI_WARN("Paged Attention backend initialization failed. Falling back to SDPA backend.");
-                GENAI_DEBUG("Paged Attention backend initialization error: %s", exception.what());
+                log_paged_attention_fallback(exception);
+                language_model = utils::singleton_core().read_model(model_str, weights);
             }
         }
 

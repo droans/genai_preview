@@ -120,28 +120,25 @@ std::shared_ptr<CacheOrchestrator> create_hybrid_orchestrator(
     ov::InferRequest request = core.compile_model(
         create_hybrid_model(core, TEST_NUM_DECODER_LAYERS)).create_infer_request();
 
-    auto kv_manager = std::make_shared<KVCacheManager>(request);
-    auto kv_block_manager = std::make_shared<BlockManager>(
+    auto kv_manager = std::make_unique<KVCacheManager>(request);
+    auto kv_block_manager = std::make_unique<BlockManager>(
         num_kv_blocks, false, kv_block_size, num_layers);
-
-    std::vector<size_t> kv_layers(num_layers);
-    std::iota(kv_layers.begin(), kv_layers.end(), 0);
 
     auto orchestrator = std::make_shared<CacheOrchestrator>();
     orchestrator->register_cache_type(
-        CacheType::KV_CACHE, kv_manager, kv_block_manager, kv_layers);
+        CacheType::KV_CACHE, std::move(kv_manager), std::move(kv_block_manager));
 
     // Register LinearAttention cache type with fixed-size-per-sequence mode.
-    auto la_manager = std::make_shared<LinearAttentionCacheManager>(request);
-    auto la_block_manager = std::make_shared<BlockManager>(
+    auto la_manager = std::make_unique<LinearAttentionCacheManager>(request);
+    auto la_block_manager = std::make_unique<BlockManager>(
         num_la_blocks,
         false,  // no prefix caching
         1,      // block_size = 1 token (one sequence per block)
-        num_layers,
+        1,      // one logical block table for all LA layers
         la_fixed_blocks_per_seq);  // fixed blocks per sequence
 
     orchestrator->register_cache_type(
-        CacheType::LINEAR_ATTENTION_CACHE, la_manager, la_block_manager, kv_layers);
+        CacheType::LINEAR_ATTENTION_CACHE, std::move(la_manager), std::move(la_block_manager));
 
     return orchestrator;
 }
@@ -178,10 +175,82 @@ TEST(TestLinearAttentionCacheManager, ConstructorAcceptsLargeStateTableSuffixes)
     LinearAttentionCacheManager manager(request);
     manager.allocate_cache_if_needed(3);
 
-    EXPECT_EQ(manager.get_num_layers(), 1);
+    EXPECT_EQ(manager.get_num_layers(), 2);
     EXPECT_EQ(manager.get_num_cache_tensors(), 2);
     EXPECT_EQ(request.get_tensor("conv_state_table.878332661264156340").get_shape(), (ov::Shape{3, 256, 128}));
     EXPECT_EQ(request.get_tensor("conv_state_table.0").get_shape(), (ov::Shape{3, 256, 128}));
+}
+
+TEST(TestCacheOrchestratorHybrid, SharedLinearAttentionRegistersSingleBlockTableLayer) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(get_dummy_hybrid_model(core,
+                                                                         /*kv_num_layers=*/3,
+                                                                         /*la_num_layers=*/3))
+                                      .create_infer_request();
+
+    SchedulerConfig config;
+    config.num_kv_blocks = 4;
+    config.num_linear_attention_blocks = 2;
+    config.max_num_seqs = 2;
+
+    auto orchestrator = CacheOrchestrator::create(request,
+                                                  config,
+                                                  [](const std::string&, size_t) {
+                                                      return std::numeric_limits<size_t>::max();
+                                                  });
+
+    auto sequence_group = create_sequence_group(99);
+    Sequence::Ptr sequence = sequence_group->get_running_sequences().front();
+    orchestrator->allocate_tokens(sequence, sequence_group, 1, sequence_group->get_prompt_len());
+
+    const auto block_tables = orchestrator->get_block_tables(sequence->get_id());
+    ASSERT_EQ(block_tables.size(), 2);
+    EXPECT_EQ(orchestrator->get_cache_type_for_layer(0), CacheType::KV_CACHE);
+    EXPECT_EQ(orchestrator->get_cache_type_for_layer(1), CacheType::LINEAR_ATTENTION_CACHE);
+
+    const auto la_block_table = orchestrator->get_linear_attention_block_table(sequence->get_id());
+    ASSERT_EQ(la_block_table.size(), 1);
+    ASSERT_EQ(block_tables[1].size(), 1);
+    EXPECT_EQ(block_tables[1][0]->get_index(), la_block_table[0]->get_index());
+
+    orchestrator->free_sequence(sequence->get_id());
+}
+
+TEST(TestCacheOrchestratorHybrid, CreateAcceptsCacheIntervalMultiplierForHybridModel) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(get_dummy_hybrid_model(core,
+                                                                         /*kv_num_layers=*/3,
+                                                                         /*la_num_layers=*/3))
+                                      .create_infer_request();
+
+    SchedulerConfig config;
+    config.num_kv_blocks = 4;
+    config.num_linear_attention_blocks = 2;
+    config.enable_prefix_caching = true;
+    config.cache_interval_multiplier = 4;
+
+    EXPECT_NO_THROW(CacheOrchestrator::create(request,
+                                              config,
+                                              [](const std::string&, size_t) {
+                                                  return std::numeric_limits<size_t>::max();
+                                              }));
+}
+
+TEST(TestCacheOrchestratorHybrid, CreateRejectsCustomCacheIntervalMultiplierWithoutLinearAttentionCache) {
+    ov::Core core;
+    ov::InferRequest request = core.compile_model(get_dummy_model(core, /*num_layers=*/3))
+                                      .create_infer_request();
+
+    SchedulerConfig config;
+    config.num_kv_blocks = 4;
+    config.cache_interval_multiplier = 4;
+
+    EXPECT_THROW(CacheOrchestrator::create(request,
+                                           config,
+                                           [](const std::string&, size_t) {
+                                               return std::numeric_limits<size_t>::max();
+                                           }),
+                 ov::Exception);
 }
 
 /// @test RequiredTokens_UsesMax
@@ -217,8 +286,8 @@ TEST(TestCacheOrchestratorHybrid, RequiredTokens_UsesMax) {
     // direct per-type computations.
     seq_group->schedule_tokens(5);
 
-    const size_t kv_required_tokens = orchestrator->get_block_manager(CacheType::KV_CACHE)->required_tokens_count(seq_group);
-    const size_t la_required_tokens = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE)->required_tokens_count(seq_group);
+    const size_t kv_required_tokens = orchestrator->get_block_manager(CacheType::KV_CACHE).required_tokens_count(seq_group);
+    const size_t la_required_tokens = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE).required_tokens_count(seq_group);
     const size_t expected = std::max(kv_required_tokens, la_required_tokens);
 
     const size_t actual = orchestrator->required_tokens_count(seq_group);
@@ -299,17 +368,17 @@ TEST(TestCacheOrchestratorHybrid, GrowFixedSize_OnlyAffectsFixed) {
         /*num_layers=*/1,
         /*la_fixed_blocks_per_seq=*/1);
 
-    auto kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
-    auto la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
+    const auto& kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
+    const auto& la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
 
-    size_t initial_kv_blocks = kv_bm->get_total_number_of_kv_blocks();
-    size_t initial_la_blocks = la_bm->get_total_number_of_kv_blocks();
+    size_t initial_kv_blocks = kv_bm.get_total_number_of_kv_blocks();
+    size_t initial_la_blocks = la_bm.get_total_number_of_kv_blocks();
 
     // Grow fixed-size capacity by 3 sequences.
     orchestrator->grow_fixed_size_capacity(3);
 
-    size_t final_kv_blocks = kv_bm->get_total_number_of_kv_blocks();
-    size_t final_la_blocks = la_bm->get_total_number_of_kv_blocks();
+    size_t final_kv_blocks = kv_bm.get_total_number_of_kv_blocks();
+    size_t final_la_blocks = la_bm.get_total_number_of_kv_blocks();
 
     // KV should be unchanged.
     EXPECT_EQ(final_kv_blocks, initial_kv_blocks);
@@ -342,17 +411,17 @@ TEST(TestCacheOrchestratorHybrid, EnsureTokenCapacity_SkipsFixed) {
         /*num_layers=*/1,
         /*la_fixed_blocks_per_seq=*/1);
 
-    auto kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
-    auto la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
+    const auto& kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
+    const auto& la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
 
-    size_t initial_kv_blocks = kv_bm->get_total_number_of_kv_blocks();
-    size_t initial_la_blocks = la_bm->get_total_number_of_kv_blocks();
+    size_t initial_kv_blocks = kv_bm.get_total_number_of_kv_blocks();
+    size_t initial_la_blocks = la_bm.get_total_number_of_kv_blocks();
 
     // Ensure token capacity for 100 tokens.
     orchestrator->ensure_token_capacity(100);
 
-    size_t final_kv_blocks = kv_bm->get_total_number_of_kv_blocks();
-    size_t final_la_blocks = la_bm->get_total_number_of_kv_blocks();
+    size_t final_kv_blocks = kv_bm.get_total_number_of_kv_blocks();
+    size_t final_la_blocks = la_bm.get_total_number_of_kv_blocks();
 
     // KV blocks should increase (at least 100 / TEST_BLOCK_SIZE = 25 blocks).
     EXPECT_GE(final_kv_blocks, (100 + TEST_BLOCK_SIZE - 1) / TEST_BLOCK_SIZE);
@@ -385,16 +454,65 @@ TEST(TestCacheOrchestratorHybrid, TotalCacheBytes_IncludesAll) {
         /*num_layers=*/1,
         /*la_fixed_blocks_per_seq=*/1);
 
-    auto kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
-    auto kv_cm = orchestrator->get_cache_manager(CacheType::KV_CACHE);
-    auto la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
-    auto la_cm = orchestrator->get_cache_manager(CacheType::LINEAR_ATTENTION_CACHE);
+    const auto& kv_bm = orchestrator->get_block_manager(CacheType::KV_CACHE);
+    const auto& kv_cm = orchestrator->get_cache_manager(CacheType::KV_CACHE);
+    const auto& la_bm = orchestrator->get_block_manager(CacheType::LINEAR_ATTENTION_CACHE);
+    const auto& la_cm = orchestrator->get_cache_manager(CacheType::LINEAR_ATTENTION_CACHE);
 
-    size_t expected_kv_bytes = num_kv_blocks * kv_cm->get_block_size_in_bytes();
-    size_t expected_la_bytes = num_la_blocks * la_cm->get_block_size_in_bytes();
+    size_t expected_kv_bytes = kv_bm.get_total_number_of_kv_blocks() * kv_cm.get_block_size_in_bytes();
+    size_t expected_la_bytes = la_bm.get_total_number_of_kv_blocks() * la_cm.get_block_size_in_bytes();
     size_t expected_total = expected_kv_bytes + expected_la_bytes;
 
     size_t actual_total = orchestrator->get_total_cache_size_in_bytes();
 
     EXPECT_EQ(actual_total, expected_total);
+}
+
+TEST(TestCacheOrchestratorHybrid, PartialPreemptionIsDisallowedWhenFixedSizeTargetNeedsBlocks) {
+    auto orchestrator = create_hybrid_orchestrator(
+        /*num_kv_blocks=*/8,
+        /*num_la_blocks=*/1,
+        TEST_BLOCK_SIZE,
+        /*num_layers=*/1,
+        /*la_fixed_blocks_per_seq=*/1);
+
+    auto victim = create_sequence_group(200, /*num_sequences=*/1);
+    auto target = create_sequence_group(201, /*num_sequences=*/1);
+    auto victim_seq = victim->get_running_sequences()[0];
+
+    // Allocate victim to occupy both KV and fixed-size LA resources.
+    orchestrator->allocate_tokens(victim_seq, victim, TEST_BLOCK_SIZE + 1, victim->get_prompt_len());
+
+    // Target has no LA allocation yet, so fixed-size cache needs blocks.
+    EXPECT_FALSE(orchestrator->can_partially_preempt(victim, target));
+
+    orchestrator->free_sequence(victim_seq->get_id());
+}
+
+TEST(TestCacheOrchestratorHybrid, PartialPreemptionIsDisallowedWhenFixedSizeVictimHasState) {
+    auto orchestrator = create_hybrid_orchestrator(
+        /*num_kv_blocks=*/16,
+        /*num_la_blocks=*/2,
+        TEST_BLOCK_SIZE,
+        /*num_layers=*/1,
+        /*la_fixed_blocks_per_seq=*/1);
+
+    auto victim = create_sequence_group(300, /*num_sequences=*/1);
+    auto target = create_sequence_group(301, /*num_sequences=*/1);
+    auto victim_seq = victim->get_running_sequences()[0];
+    auto target_seq = target->get_running_sequences()[0];
+
+    // Allocate both groups once to consume fixed-size LA blocks. This makes LA deficit zero for target.
+    orchestrator->allocate_tokens(victim_seq, victim, TEST_BLOCK_SIZE * 2 + 1, victim->get_prompt_len());
+    orchestrator->allocate_tokens(target_seq, target, 1, target->get_prompt_len());
+
+    // Increase target token demand so KV has a non-zero deficit.
+    target->schedule_tokens(TEST_BLOCK_SIZE + 1);
+
+    // The target already owns fixed-size LA state, but the victim also owns LA state
+    // that cannot represent token-level rollback. Partial preemption must be rejected.
+    EXPECT_FALSE(orchestrator->can_partially_preempt(victim, target));
+
+    orchestrator->free_sequence(victim_seq->get_id());
+    orchestrator->free_sequence(target_seq->get_id());
 }

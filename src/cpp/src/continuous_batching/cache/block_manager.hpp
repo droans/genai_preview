@@ -6,10 +6,12 @@
 #include <memory>
 #include <list>
 #include <map>
+#include <set>
 #include <algorithm>
 #include <fstream>
 #include <chrono>
 
+#include "logger.hpp"
 #include "sequence_group.hpp"
 
 namespace ov::genai {
@@ -229,8 +231,12 @@ public:
     ~BlockAllocator() {
         // sanity check to validate that all blocks are freed
         for (auto& free_block : m_free_blocks_num) {
-            size_t free_and_overwritable_block_cnt = free_block + num_overwriteable_blocks();
-            OPENVINO_ASSERT(m_total_num_blocks == free_and_overwritable_block_cnt, "Expected num free blocks: ", m_total_num_blocks, ", actual: ", free_and_overwritable_block_cnt);
+            const size_t free_and_overwritable_block_cnt = free_block + num_overwriteable_blocks();
+            if (m_total_num_blocks != free_and_overwritable_block_cnt) {
+                GENAI_ERR("BlockAllocator leaked blocks. Expected num free blocks: %zu, actual: %zu",
+                          m_total_num_blocks,
+                          free_and_overwritable_block_cnt);
+            }
         }
     }
 
@@ -563,7 +569,13 @@ public:
 
     ~BlockManager() {
         // sanity check that all sequences are freed
-        OPENVINO_ASSERT(m_block_table.empty());
+        const size_t leaked_tables = m_block_table.size();
+        const uint64_t first_leaked_seq_id = leaked_tables > 0 ? m_block_table.begin()->first : 0;
+        if (!m_block_table.empty()) {
+            GENAI_ERR("BlockManager leaked sequence block tables: %zu, first leaked sequence id: %llu",
+                      leaked_tables,
+                      static_cast<unsigned long long>(first_leaked_seq_id));
+        }
     }
 
     /**
@@ -574,6 +586,10 @@ public:
      */
     const std::vector<BlocksPerLayer>& get_block_tables(uint64_t seq_id) const {
         return m_block_table.at(seq_id);
+    }
+
+    size_t get_num_layers() const {
+        return m_num_layers;
     }
 
     /**
@@ -605,10 +621,12 @@ public:
      */
     size_t free_group_partially(SequenceGroup::Ptr sequence_group, size_t num_required_blocks) {
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
-        size_t blocks_num = std::ceil(num_required_blocks / sequence_group->get_not_finished_sequences().size());
-        auto not_finished_sequences = sequence_group->get_not_finished_sequences();
+        const auto not_finished_sequences = sequence_group->get_not_finished_sequences();
+        const size_t num_not_finished_sequences = not_finished_sequences.size();
+        // ceil(num_required_blocks / num_not_finished_sequences) with integer arithmetic
+        const size_t blocks_num = (num_required_blocks + num_not_finished_sequences - 1) / num_not_finished_sequences;
         for (size_t idx = 0; idx < not_finished_sequences.size(); ++idx) {
-            auto seq_id = not_finished_sequences[idx]->get_id();
+            const auto seq_id = not_finished_sequences[idx]->get_id();
             OPENVINO_ASSERT(m_block_table.count(seq_id) > 0, "Invalid sequence group.");
             free_sequence_partially(seq_id, blocks_num);
         }
@@ -630,7 +648,7 @@ public:
         size_t blocks_released = 0;
         auto not_finished_sequences = sequence_group->get_not_finished_sequences();
         for (size_t idx = 0; idx < not_finished_sequences.size(); ++idx) {
-            auto seq_id = not_finished_sequences[idx]->get_id();
+            const auto seq_id = not_finished_sequences[idx]->get_id();
             OPENVINO_ASSERT(m_block_table.count(seq_id) > 0, "Invalid sequence group.");
             if (free_last_block(seq_id)) {
                 blocks_released++;
@@ -731,6 +749,20 @@ public:
         }
         size_t victim_occupied = get_number_of_blocks_occupied_by_sequence(victim);
         return victim_occupied > needed;
+    }
+
+    bool can_partially_preempt_victim(SequenceGroup::Ptr victim) {
+        if (!m_fixed_blocks_per_sequence) {
+            return true;
+        }
+
+        std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
+        for (const auto& sequence : victim->get_not_finished_sequences()) {
+            if (m_block_table.find(sequence->get_id()) != m_block_table.end()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

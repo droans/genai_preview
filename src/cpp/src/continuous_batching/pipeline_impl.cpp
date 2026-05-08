@@ -210,8 +210,8 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
                                                        is_use_xattention,
                                                        is_use_adaptive_rkv);
         if (eviction_config.apply_rotation) {
-            auto kv_mgr = std::static_pointer_cast<KVCacheManager>(cache_orchestrator->get_cache_manager(CacheType::KV_CACHE));
-            _prepare_rotation_data_storage(normalized_config, kv_mgr->get_v_head_size(0));
+            const auto& kv_mgr = static_cast<const KVCacheManager&>(cache_orchestrator->get_cache_manager(CacheType::KV_CACHE));
+            _prepare_rotation_data_storage(normalized_config, kv_mgr.get_v_head_size(0));
         }
     } else {
         m_scheduler = std::make_shared<Scheduler>(cache_orchestrator, normalized_config, can_use_partial_preemption);
@@ -361,7 +361,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         scheduler_output = m_scheduler->schedule(m_requests);
         scheduling_timer.end();
 
-        m_pipeline_metrics.kv_cache_size_in_bytes = scheduler_output.m_cache_size_in_bytes;
+        m_pipeline_metrics.cache_size_in_bytes = scheduler_output.m_cache_size_in_bytes;
         m_pipeline_metrics.scheduled_requests = scheduler_output.m_scheduled_sequence_groups_ids.size();
         m_pipeline_metrics.cache_usage = scheduler_output.m_cache_usage;
         m_pipeline_metrics.max_cache_usage = std::max(m_pipeline_metrics.max_cache_usage, scheduler_output.m_cache_usage);
@@ -642,9 +642,9 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::generate(const std::vector<o
     generate_timer.end();
     
     const auto& scheduler_config = m_scheduler->get_config();
-    // Clear KV-cache in case of dynamic cache allocation and no prefix caching
+    // Clear cache in case of dynamic cache allocation and no prefix caching
     if (!scheduler_config.enable_prefix_caching && scheduler_config.cache_size == 0 && scheduler_config.num_kv_blocks == 0) {
-        m_scheduler->clear_kv_cache();
+        m_scheduler->clear_cache();
     }
     return results;
 }
@@ -691,7 +691,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_reset_cache_usage_stat
     m_previous_step_cache_usages.clear();
     m_pipeline_metrics.max_cache_usage = 0.0;
     m_pipeline_metrics.avg_cache_usage = 0.0;
-    m_pipeline_metrics.kv_cache_size_in_bytes = 0;
+    m_pipeline_metrics.cache_size_in_bytes = 0;
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::drop_requests() {

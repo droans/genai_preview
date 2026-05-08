@@ -4,6 +4,8 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
+#include <optional>
 #include <sstream>
 
 #include "openvino/genai/cache_eviction.hpp"
@@ -11,7 +13,7 @@
 
 namespace ov::genai {
 
-inline constexpr std::size_t DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL = 128;
+inline constexpr std::size_t DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER = 8;
 
 struct SchedulerConfig {
     // a maximum number of tokens to batch
@@ -30,13 +32,15 @@ struct SchedulerConfig {
 
     // total number of linear attention blocks available to scheduler logic.
     // Each block holds the full state for one sequence across all linear attention ops.
-    // When 0, automatically derived from num_kv_blocks if linear attention layers are detected.
+    // When 0, automatically derived from max_num_seqs if linear attention layers are detected.
     std::size_t num_linear_attention_blocks = 0;
 
-    // Linear-attention checkpoint interval used when interval-based paging is enabled.
-    // Custom values are supported only for models with linear attention cache inputs.
-    // Must be greater than 0 when prefix caching is enabled.
-    std::size_t cache_interval = DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL;
+    // Multiplier used to derive the linear-attention checkpoint interval for prefix caching.
+    // The internal cache interval is calculated as KV cache block size * cache_interval_multiplier.
+    // When unset, the default value 8 is used for hybrid models with prefix caching.
+    // Explicit values are supported only for models with linear attention cache inputs.
+    // 0 is valid only when prefix caching is disabled.
+    std::optional<std::size_t> cache_interval_multiplier = std::nullopt;
 
     // whether to split prompt / generate to different scheduling phases
     // Allows to process prompt partially in case when batch size is limited. 
@@ -81,9 +85,21 @@ struct SchedulerConfig {
      */
     SparseAttentionConfig sparse_attention_config;
 
+    std::size_t get_cache_interval(std::size_t kv_block_size) const {
+        const std::size_t effective_cache_interval_multiplier =
+            cache_interval_multiplier.value_or(DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER);
+        OPENVINO_ASSERT(effective_cache_interval_multiplier == 0 ||
+                            kv_block_size <= std::numeric_limits<std::size_t>::max() / effective_cache_interval_multiplier,
+                        "SchedulerConfig cache_interval_multiplier is too large for KV cache block size. cache_interval_multiplier: ",
+                        effective_cache_interval_multiplier,
+                        ", KV cache block size: ",
+                        kv_block_size);
+        return kv_block_size * effective_cache_interval_multiplier;
+    }
+
     void validate() const {
-        OPENVINO_ASSERT(!enable_prefix_caching || cache_interval > 0,
-                        "SchedulerConfig cache_interval must be greater than 0 when prefix caching is enabled");
+        OPENVINO_ASSERT(!enable_prefix_caching || !cache_interval_multiplier.has_value() || cache_interval_multiplier.value() > 0,
+                "SchedulerConfig cache_interval_multiplier must be greater than 0 when prefix caching is enabled");
     }
 
     bool operator==(const SchedulerConfig& other) const {
@@ -91,7 +107,7 @@ struct SchedulerConfig {
                cache_size == other.cache_size && num_linear_attention_blocks == other.num_linear_attention_blocks &&
                dynamic_split_fuse == other.dynamic_split_fuse && use_cache_eviction == other.use_cache_eviction &&
                max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching &&
-               cache_interval == other.cache_interval;
+               cache_interval_multiplier == other.cache_interval_multiplier;
     }
 
     /**
@@ -108,7 +124,11 @@ struct SchedulerConfig {
         oss << "  num_kv_blocks: " << num_kv_blocks << "\n";
         oss << "  cache_size: " << cache_size << "\n";
         oss << "  num_linear_attention_blocks: " << num_linear_attention_blocks << "\n";
-        oss << "  cache_interval: " << cache_interval << "\n";
+        if (cache_interval_multiplier.has_value()) {
+            oss << "  cache_interval_multiplier: " << cache_interval_multiplier.value() << "\n";
+        } else {
+            oss << "  cache_interval_multiplier: unset\n";
+        }
         oss << "  dynamic_split_fuse: " << std::boolalpha << dynamic_split_fuse << "\n";
         oss << "  use_cache_eviction: " << std::boolalpha << use_cache_eviction << "\n";
         if (use_cache_eviction) {

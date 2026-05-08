@@ -470,13 +470,13 @@ jobs:
             run_condition: ${{ fromJSON(needs.smart_ci.outputs.affected_components).RAG.test }}
             timeout: 30
           - name: 'WWB tests'
-            cmd: 'python -m pytest -v ./tools/who_what_benchmark/tests -m "not nanollava and not transformers_lower_v5" -k "not videochat"'
+            cmd: 'python -m pytest -v ./tools/who_what_benchmark/tests -m "not nanollava and not transformers_lower_v5"'
             run_condition: ${{ fromJSON(needs.smart_ci.outputs.affected_components).WWB.test }}
             timeout: 120
           - name: 'WWB tests with transformers under 5.0'
             cmd: |
               python -m pip install transformers==4.57.6
-              python -m pytest -v ./tools/who_what_benchmark/tests -m "transformers_dependent or transformers_lower_v5" -k "not videochat"
+              python -m pytest -v ./tools/who_what_benchmark/tests -m "transformers_dependent or transformers_lower_v5"
             run_condition: ${{ fromJSON(needs.smart_ci.outputs.affected_components).WWB.test }}
             timeout: 120
           - name: 'WWB tests (nanollava)'
@@ -724,10 +724,11 @@ jobs:
         run: |
           source ${{ env.INSTALL_DIR }}/setupvars.sh
           chmod +x ${{ env.INSTALL_DIR }}/tests/tests_continuous_batching
-          ${{ env.INSTALL_DIR }}/tests/tests_continuous_batching --gtest_filter="-AddSecondInputTest.*"
+          ${{ env.INSTALL_DIR }}/tests/tests_continuous_batching --gtest_filter="-AddSecondInputTest.*:LLMPipelineBackendRealModel*"
         env:
           TEST_MODELS_BASE_DIR: "${{ env.HF_HOME }}/ov_test_models"
           CACHE_TYPES_CSV: "${{ env.INSTALL_DIR }}/tests/data/cache_types_models.csv"
+          OPENVINO_TOKENIZERS_PATH_GENAI: "${{ env.INSTALL_DIR }}/runtime/lib/arm64/Release/libopenvino_tokenizers.dylib"
 
       - name: Test C++ Tools
         run: |

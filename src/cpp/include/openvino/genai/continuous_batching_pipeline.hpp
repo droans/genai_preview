@@ -42,17 +42,17 @@ struct PipelineMetrics {
     size_t scheduled_requests = 0;
 
     /**
-    * Percentage of KV cache usage in the last generation step.
+    * Maximum cache usage percentage across registered cache types in the last generation step.
     */
     float cache_usage = 0.0;
 
     /**
-    * Max KV cache usage during the last .generate() call in %
+    * Maximum cache usage percentage observed during the last .generate() call.
     */
     float max_cache_usage = 0.0;
 
     /**
-    * Running average of the KV cache usage during the last .generate() call, with max window size of 1000 internal model inferences
+    * Running average of cache usage percentage during the last .generate() call, with max window size of 1000 internal model inferences.
     */
     float avg_cache_usage = 0.0;
 
@@ -62,11 +62,11 @@ struct PipelineMetrics {
     float inference_duration = 0.0;
 
     /**
-     * Total allocated KV cache size in bytes, based on the total number of KV blocks.
-     * This value represents reserved/allocated memory for the KV cache and does not
-     * distinguish between used and unused portions in dynamic KV cache configurations.
+    * Total allocated cache size in bytes across registered cache types, based on the total number of cache blocks.
+     * This value represents reserved/allocated memory for the cache and does not
+     * distinguish between used and unused portions in dynamic cache configurations.
      */
-    size_t kv_cache_size_in_bytes = 0;
+    size_t cache_size_in_bytes = 0;
 };
 
 class OPENVINO_GENAI_EXPORTS ContinuousBatchingPipeline {
@@ -115,13 +115,15 @@ private:
                                const ov::AnyMap& tokenizer_properties = {},
                                const ov::AnyMap& vision_encoder_properties = {});
 
-    ContinuousBatchingPipeline(const std::shared_ptr<ov::Model>& model,
+    // Used by LLMPipeline's ContinuousBatchingAdapter when the language model is already loaded.
+    // model_config_dir keeps access to config.json for Eagle3 metadata and to a stable cache path.
+    ContinuousBatchingPipeline(const std::shared_ptr<ov::Model>& language_model,
                                const ov::genai::Tokenizer& tokenizer,
                                const SchedulerConfig& scheduler_config,
                                const std::string& device,
                                const ov::AnyMap& properties,
                                const ov::genai::GenerationConfig& generation_config,
-                               const std::filesystem::path& config_path = {});
+                               const std::filesystem::path& model_config_dir = {});
 
 public:
     ContinuousBatchingPipeline(const std::filesystem::path& models_path,

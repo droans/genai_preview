@@ -66,9 +66,9 @@ public:
         size_t m_total_num_scheduled_tokens = 0;
         // dedicated prompt phase
         bool is_prompt = false;
-        // current cache usage
+        // maximum cache usage across registered cache types
         float m_cache_usage = 0.0;
-        // cache usage size in bytes
+        // total allocated cache size in bytes across registered cache types
         size_t m_cache_size_in_bytes = 0;
 
         std::map<uint64_t, LinearAttentionPagingData> m_linear_attention_paging_data;
@@ -174,8 +174,8 @@ public:
         m_cache_orchestrator->free_blocks_from_sequence(seq_id, per_layer_logical_block_indices_to_free, cache_type);
     }
 
-    void clear_kv_cache() {
-        OPENVINO_ASSERT(m_config.enable_prefix_caching == false, "KV-cache should not be cleared if prefix caching is enabled.");
+    void clear_cache() {
+        OPENVINO_ASSERT(m_config.enable_prefix_caching == false, "Cache should not be cleared if prefix caching is enabled.");
         m_cache_orchestrator->clear();
     }
 
@@ -211,13 +211,14 @@ private:
             return m_cache_orchestrator->num_free_blocks() > prev_blocks_count;
         }
 
-        size_t tokens_needed = m_cache_orchestrator->required_tokens_count(target);
         if (victim->get_sampling_parameters().is_beam_search()) {
-            preempted_tokens = m_cache_orchestrator->free_partially_beam_search_group_by_tokens(victim, tokens_needed);
+            preempted_tokens = m_cache_orchestrator->free_partially_beam_search_group_for_target(victim, target);
         }
         else {
-            preempted_tokens = m_cache_orchestrator->free_group_partially_by_tokens(victim, tokens_needed);
+            preempted_tokens = m_cache_orchestrator->free_group_partially_for_target(victim, target);
         }
+
+        preempted_tokens = std::min(preempted_tokens, processed_tokens);
 
         // case when preemption requires preempt prompt tokens
         if (!m_config.dynamic_split_fuse && processed_tokens - preempted_tokens < victim->get_prompt_len()) {
@@ -293,7 +294,7 @@ private:
 
                 // apply KV cache limitations
                 while (m_cache_orchestrator->available_token_slots(sequence_group) < num_scheduled_tokens) {
-                    if (!_try_increase_cache()) {
+                    if (!_try_increase_cache(sequence_group)) {
                         break;
                     }
                 }
@@ -372,7 +373,7 @@ private:
                 sequence_group->schedule_tokens(num_scheduled_tokens_per_seq);
 
                 while (!m_cache_orchestrator->can_append_slots(sequence_group)) {
-                    if (!_try_increase_cache()) {
+                    if (!_try_increase_cache(sequence_group)) {
                         break;
                     }
                 }
@@ -410,15 +411,11 @@ private:
                         scheduler_output.m_adaptive_rkv_evictable_sizes[seq_id] = _schedule_adaptive_rkv_evictable_size(sequence_group);
                     }
 
-
-
-                    // merge per-type copy_blocks
                     for (auto& [type, copy_map] : per_type_copy_map) {
-                        for (const auto& src_dst : copy_map) {
-                            size_t src_index = src_dst.first;
-                            const std::list<size_t>& dst_indexes = src_dst.second;
-                            for (const auto dst_index : dst_indexes)
-                                typed_block_copy_map[type][src_index].push_back(dst_index);
+                        auto& accumulated_copy_map = typed_block_copy_map[type];
+                        for (auto& [src_index, dst_indexes] : copy_map) {
+                            auto& accumulated_dst_indexes = accumulated_copy_map[src_index];
+                            accumulated_dst_indexes.splice(accumulated_dst_indexes.end(), dst_indexes);
                         }
                     }
 
@@ -480,7 +477,7 @@ private:
 
                 // apply KV cache limitations
                 while (!m_cache_orchestrator->can_allocate_tokens(sequence_group, sequence_len)){
-                    if (!_try_increase_cache()) {
+                    if (!_try_increase_cache(sequence_group)) {
                         break;
                     }
                 }
@@ -559,32 +556,40 @@ private:
         m_dynamic_memory_allocation = true;
     }
 
-    bool _try_increase_cache() {
+    bool _try_increase_cache(SequenceGroup::CPtr sequence_group = nullptr) {
         if (!m_dynamic_memory_allocation) {
             return false;
         }
+        bool grew_capacity = false;
+        if (sequence_group) {
+            grew_capacity = m_cache_orchestrator->ensure_sequence_capacity(sequence_group);
+        }
+
         auto device = m_cache_orchestrator->get_device();
         const size_t growth_tokens = static_cast<size_t>(m_cache_growth_num_tokens);
+        if (growth_tokens == 0) {
+            return grew_capacity;
+        }
 
         if (device.find("GPU") == std::string::npos) {
-            m_cache_orchestrator->grow_capacity_by_tokens(growth_tokens);
+            grew_capacity = m_cache_orchestrator->grow_capacity_by_tokens(growth_tokens) || grew_capacity;
         } else {
             const size_t available_gpu_memory = utils::get_available_gpu_memory(
                 m_cache_orchestrator->get_device(),
                 m_cache_orchestrator->get_num_cache_tensors());
             size_t required_memory = m_cache_orchestrator->memory_cost_for_additional_tokens(growth_tokens);
             if (required_memory <= available_gpu_memory) {
-                m_cache_orchestrator->grow_capacity_by_tokens(growth_tokens);
+                grew_capacity = m_cache_orchestrator->grow_capacity_by_tokens(growth_tokens) || grew_capacity;
             } else {
                 size_t possible_tokens = m_cache_orchestrator->max_additional_tokens_for_memory(available_gpu_memory);
                 if (possible_tokens > 0) {
-                    m_cache_orchestrator->grow_capacity_by_tokens(possible_tokens);
+                    grew_capacity = m_cache_orchestrator->grow_capacity_by_tokens(possible_tokens) || grew_capacity;
                 } else {
-                    return false;
+                    return grew_capacity;
                 }
             }
         }
-        return true;
+        return grew_capacity;
     }
 
     void _set_linear_attention_paging_data(Output& scheduler_output,
@@ -608,9 +613,9 @@ private:
 
         OPENVINO_ASSERT(num_scheduled_tokens > 0, "Linear attention paging requires scheduled tokens for sequence ", seq_id);
 
-        const size_t cache_interval = m_config.cache_interval;
+        const size_t cache_interval = m_cache_orchestrator->get_block_size(CacheType::LINEAR_ATTENTION_CACHE);
         OPENVINO_ASSERT(cache_interval > 0,
-                "Internal error: SchedulerConfig cache_interval must be greater than 0 when prefix caching is enabled");
+            "Internal error: linear attention cache interval must be greater than 0 when prefix caching is enabled");
         const size_t read_block_position = num_processed_tokens == 0 ? 0 : (num_processed_tokens - 1) / cache_interval;
         const size_t write_block_begin = num_processed_tokens / cache_interval;
         const size_t write_blocks_count = (num_processed_tokens % cache_interval + num_scheduled_tokens + cache_interval - 1) / cache_interval;
