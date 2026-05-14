@@ -209,11 +209,11 @@ class BlockAllocator {
 public:
     /**
      * Constructs the BlockAllocator.
-    * @param num_blocks Number of cache blocks in the free block pool to be owned by this allocator.
+     * @param num_blocks Number of cache blocks in the free block pool to be owned by this allocator.
      * @param enable_prefix_caching Whether prefix caching should be enabled for this allocator.
      * See also the equivalent parameter in ov::genai::ContinuousBatchingPipeline
-    * @param num_layers The number of separate block-table layers associated with the allocator.
-    * Blocks returned will be vectors with this size, each vector entry to be associated with a separate cache layer.
+     * @param num_layers The number of separate block-table layers associated with the allocator.
+     * Blocks returned will be vectors with this size, each vector entry to be associated with a separate cache layer.
      */
     BlockAllocator(size_t num_blocks, bool enable_prefix_caching, size_t num_layers = 1) :
             m_total_num_blocks(num_blocks), m_num_layers(num_layers), m_enable_prefix_caching(enable_prefix_caching), m_overwriteable_blocks(num_layers) {
@@ -222,7 +222,7 @@ public:
         if (num_blocks > 0) {
             m_free_blocks_num = std::vector<size_t>(num_layers, num_blocks);
             for (auto& per_layer_block_list : m_free_blocks) {
-                for (int block_id = 0; block_id < m_total_num_blocks; ++block_id) {
+                for (size_t block_id = 0; block_id < m_total_num_blocks; ++block_id) {
                     per_layer_block_list.push_back(std::make_shared<CacheBlock>(block_id));
                 }
             }
@@ -246,11 +246,11 @@ public:
     void increase_block_count(size_t new_block_count) {
         OPENVINO_ASSERT(new_block_count > m_total_num_blocks, "New blocks number should be more than previous blocks number.");
         size_t added_blocks = new_block_count - m_total_num_blocks;
-        for (auto idx = 0; idx < m_free_blocks_num.size(); idx++) {
+        for (size_t idx = 0; idx < m_free_blocks_num.size(); ++idx) {
             m_free_blocks_num[idx] += added_blocks;
         }
         for (auto& per_layer_block_list : m_free_blocks) {
-            for (int block_id = m_total_num_blocks; block_id < new_block_count; ++block_id) {
+            for (size_t block_id = m_total_num_blocks; block_id < new_block_count; ++block_id) {
                 per_layer_block_list.push_back(std::make_shared<CacheBlock>(block_id));
             }
         }
@@ -570,11 +570,11 @@ public:
 
     /**
      * Constructs the BlockManager.
-    * @param num_blocks Number of cache blocks available for assignment to the sequences.
+     * @param num_blocks Number of cache blocks available for assignment to the sequences.
      * @param enable_prefix_caching Whether prefix caching should be enabled for this allocator.
      * See also the equivalent parameter in ov::genai::ContinuousBatchingPipeline
-    * @param block_size The size of an individual cache block in tokens.
-    * @param num_layers The number of separate block-table layers associated with the manager.
+     * @param block_size The size of an individual cache block in tokens.
+     * @param num_layers The number of separate block-table layers associated with the manager.
      * In current implementation each layer must have the same number of logical blocks allocated at all times.
      * @param fixed_blocks_per_sequence When > 0, each sequence is allocated exactly this many blocks
      *        regardless of context length. Used for fixed-size caches (e.g. CausalConv1D state).
@@ -1344,54 +1344,10 @@ public:
         auto sequence = sequences[0];
 
         if (m_restore_latest_prefix_block_only) {
-            size_t interval_end = capped_token_position;
-            while (interval_end > 0 && plan.empty()) {
-                const size_t interval_start = ((interval_end - 1) / m_block_size) * m_block_size;
-                for (size_t content_len = interval_end; content_len > interval_start; --content_len) {
-                    if (m_allocator.has_cached_block(sequence->get_hash(content_len, m_block_size),
-                                                     m_prefix_hash_to_occupied_block_map)) {
-                        plan.block_content_lengths.push_back(content_len);
-                        plan.cache_token_position = content_len;
-                        plan.processed_tokens = get_processed_tokens_after_restore(content_len, prompt_len);
-                        plan.logical_block_start = (content_len - 1) / m_block_size;
-                        break;
-                    }
-                }
-                interval_end = interval_start;
-            }
-            return plan;
+            return get_latest_prefix_restore_plan(sequence, capped_token_position, prompt_len);
         }
 
-        size_t content_len = 0;
-        while (content_len < capped_token_position) {
-            size_t prev_iteration_content_len = content_len;
-            content_len += m_block_size;
-            if (content_len > capped_token_position) {
-                content_len = capped_token_position;
-            }
-            const auto full_block_hash = sequence->get_hash(content_len, m_block_size);
-            if (m_allocator.has_cached_block(full_block_hash, m_prefix_hash_to_occupied_block_map)) {
-                plan.block_content_lengths.push_back(content_len);
-                plan.cache_token_position = content_len;
-                plan.processed_tokens = get_processed_tokens_after_restore(content_len, prompt_len);
-            } else {
-                for (size_t i = 1; i < m_block_size; i++) {
-                    if (prev_iteration_content_len + i > capped_token_position) {
-                        break;
-                    }
-                    const size_t partial_content_len = prev_iteration_content_len + i;
-                    const auto hash = sequence->get_hash(partial_content_len, m_block_size);
-                    if (m_allocator.has_cached_block(hash, m_prefix_hash_to_occupied_block_map)) {
-                        plan.block_content_lengths.push_back(partial_content_len);
-                        plan.cache_token_position = partial_content_len;
-                        plan.processed_tokens = get_processed_tokens_after_restore(partial_content_len, prompt_len);
-                        break;
-                    }
-                }
-                break;
-            }
-        }
-        return plan;
+        return get_full_prefix_restore_plan(sequence, capped_token_position, prompt_len);
     }
 
     void restore_cached_blocks(SequenceGroup::Ptr group, const PrefixRestorePlan& plan) {
@@ -1442,6 +1398,91 @@ public:
     }
 
 private:
+    PrefixRestorePlan get_full_prefix_restore_plan(const Sequence::Ptr& sequence,
+                                                   size_t capped_token_position,
+                                                   size_t prompt_len) const {
+        PrefixRestorePlan plan;
+        size_t content_len = 0;
+        while (content_len < capped_token_position) {
+            size_t prev_iteration_content_len = content_len;
+            content_len += m_block_size;
+            if (content_len > capped_token_position) {
+                content_len = capped_token_position;
+            }
+            const auto full_block_hash = sequence->get_hash(content_len, m_block_size);
+            if (m_allocator.has_cached_block(full_block_hash, m_prefix_hash_to_occupied_block_map)) {
+                plan.block_content_lengths.push_back(content_len);
+                plan.cache_token_position = content_len;
+                plan.processed_tokens = get_processed_tokens_after_restore(content_len, prompt_len);
+            } else {
+                for (size_t i = 1; i < m_block_size; i++) {
+                    if (prev_iteration_content_len + i > capped_token_position) {
+                        break;
+                    }
+                    const size_t partial_content_len = prev_iteration_content_len + i;
+                    const auto hash = sequence->get_hash(partial_content_len, m_block_size);
+                    if (m_allocator.has_cached_block(hash, m_prefix_hash_to_occupied_block_map)) {
+                        plan.block_content_lengths.push_back(partial_content_len);
+                        plan.cache_token_position = partial_content_len;
+                        plan.processed_tokens = get_processed_tokens_after_restore(partial_content_len, prompt_len);
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        return plan;
+    }
+
+    PrefixRestorePlan get_latest_prefix_restore_plan(const Sequence::Ptr& sequence,
+                                                     size_t capped_token_position,
+                                                     size_t prompt_len) const {
+        PrefixRestorePlan plan;
+        size_t latest_content_len = 0;
+        size_t interval_end = capped_token_position;
+        while (interval_end > 0) {
+            size_t content_len = 0;
+            if (!find_latest_cached_content_len(sequence, interval_end, content_len)) {
+                if (!plan.empty()) {
+                    break;
+                }
+                interval_end = get_interval_start(interval_end);
+                continue;
+            }
+            if (latest_content_len == 0) {
+                latest_content_len = content_len;
+            }
+            plan.block_content_lengths.push_back(content_len);
+            interval_end = get_interval_start(content_len);
+        }
+
+        if (plan.empty()) {
+            return plan;
+        }
+
+        std::reverse(plan.block_content_lengths.begin(), plan.block_content_lengths.end());
+        plan.cache_token_position = latest_content_len;
+        plan.processed_tokens = get_processed_tokens_after_restore(latest_content_len, prompt_len);
+        plan.logical_block_start = (plan.block_content_lengths.front() - 1) / m_block_size;
+        return plan;
+    }
+
+    bool find_latest_cached_content_len(const Sequence::Ptr& sequence, size_t interval_end, size_t& content_len) const {
+        const size_t interval_start = get_interval_start(interval_end);
+        for (size_t candidate_len = interval_end; candidate_len > interval_start; --candidate_len) {
+            if (m_allocator.has_cached_block(sequence->get_hash(candidate_len, m_block_size),
+                                             m_prefix_hash_to_occupied_block_map)) {
+                content_len = candidate_len;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    size_t get_interval_start(size_t interval_end) const {
+        return ((interval_end - 1) / m_block_size) * m_block_size;
+    }
+
     static size_t get_processed_tokens_after_restore(size_t content_len, size_t prompt_len) {
         return content_len == prompt_len ? content_len - 1 : content_len;
     }
